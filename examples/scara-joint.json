@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "kind": "scara",
+  "l1": 350.0,
+  "l2": 250.0,
+  "l3": 60.0,
+  "q1min": -150.0,
+  "q1max": 150.0,
+  "q2min": -150.0,
+  "q2max": 150.0,
+  "rmin": 120.0,
+  "rmax": 600.0,
+  "xmax": 650.0,
+  "ymax": 500.0,
+  "zmax": 400.0,
+  "kp": 8.0,
+  "tau": 0.12,
+  "dt": 0.01,
+  "bits": 16,
+  "frequency": 100.0,
+  "cycles": 1,
+  "speed": 120.0,
+  "angular_speed": 180.0,
+  "duration": 4.0,
+  "mode": "contour",
+  "path": "table",
+  "start_x": 500.0,
+  "start_y": 0.0,
+  "start_z": 180.0,
+  "end_x": 350.0,
+  "end_y": 200.0,
+  "end_z": 180.0,
+  "center_x": 380.0,
+  "center_y": 0.0,
+  "radius": 80.0,
+  "orientation": 0.0,
+  "coordinate_mode": "joint",
+  "points": [
+    [
+      -30,
+      80
+    ],
+    [
+      -10,
+      110
+    ],
+    [
+      10,
+      80
+    ],
+    [
+      30,
+      110
+    ],
+    [
+      50,
+      80
+    ]
+  ]
+}

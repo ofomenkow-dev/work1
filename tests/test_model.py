@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from robot_lab.model import Config, desired, forward, inverse, simulate, workspace
+from robot_lab.model import Config, desired, forward, inverse, simulate, workspace, joint_pair, tool_angle, table_pair
 
 
 class Kinematics(unittest.TestCase):
@@ -44,7 +44,7 @@ class Kinematics(unittest.TestCase):
 class Simulation(unittest.TestCase):
     def test_settles(self):
         for kind in ('scara','cartesian','cylindrical'):
-            r=simulate(Config(kind=kind))
+            r=simulate(Config(kind=kind,mode='position',path='line'))
             self.assertEqual(len(r.samples),401)
             self.assertLess(r.final,.1)
             self.assertGreater(r.maximum,100)
@@ -61,11 +61,11 @@ class Simulation(unittest.TestCase):
                 if path=='circle':self.assertLess(math.dist(r.samples[0].desired,r.samples[-1].desired),1e-9)
 
     def test_delay(self):
-        c=Config(kind='cartesian',mode='contour')
+        c=Config(kind='cartesian',mode='contour',path='line')
         self.assertGreater(simulate(replace(c,cycles=10)).rms,simulate(replace(c,cycles=0)).rms)
 
     def test_bits(self):
-        c=Config(kind='cartesian',end_x=351.123,end_y=201.345,end_z=261.777)
+        c=Config(kind='cartesian',mode='position',path='line',end_x=351.123,end_y=201.345)
         self.assertLess(simulate(replace(c,bits=20)).final,simulate(replace(c,bits=6)).final)
 
     def test_velocity(self):
@@ -123,6 +123,96 @@ class Projects(unittest.TestCase):
             p=Path(tmp)/'bad.json'
             p.write_text('{"version":99}')
             with self.assertRaises(ValueError):Config.load(p)
+
+
+
+class HorizontalDrawing(unittest.TestCase):
+    def test_plane_fixed_in_all_modes(self):
+        for kind in ('scara','cartesian','cylindrical'):
+            for path in ('line','circle','table'):
+                for mode in ('position','contour'):
+                    if path=='circle' and mode=='position':continue
+                    c=Config(kind=kind,path=path,mode=mode,end_z=399,center_y=100)
+                    r=simulate(c)
+                    self.assertTrue(all(s.desired[2]==c.start_z and s.actual[2]==c.start_z for s in r.samples))
+
+    def test_xy_table_interpolation_and_vertices(self):
+        c=Config(duration=4,points=[[300,100],[400,200],[500,100]])
+        self.assertEqual(desired(c,0),(300,100,c.start_z))
+        self.assertEqual(desired(c,1),(350,150,c.start_z))
+        self.assertEqual(desired(c,2),(400,200,c.start_z))
+        self.assertEqual(desired(c,4),(500,100,c.start_z))
+        r=simulate(c)
+        self.assertEqual(r.samples[200].desired,desired(c,2))
+
+    def test_joint_table_preserves_negative_elbow(self):
+        c=Config(coordinate_mode='joint',duration=2,points=[[20,-70],[40,-100],[10,-80]])
+        r=simulate(c)
+        expected=joint_pair(c,c.points[0])
+        self.assertEqual(r.samples[0].q,expected)
+        self.assertTrue(all(s.q[1]<0 for s in r.samples))
+        self.assertEqual(desired(c,1),forward(c,joint_pair(c,[40,-100])))
+        self.assertEqual(desired(c,.5),forward(c,joint_pair(c,[30,-85])))
+
+    def test_joint_table_units_all_schemes(self):
+        for kind,points in [('scara',[[10,70],[30,100]]),
+                            ('cylindrical',[[10,300],[30,450]]),
+                            ('cartesian',[[300,100],[450,200]])]:
+            c=Config(kind=kind,coordinate_mode='joint',points=points,orientation=25)
+            r=simulate(c)
+            self.assertAlmostEqual(tool_angle(c,r.samples[0].q),math.radians(25))
+            self.assertEqual(r.samples[0].desired,forward(c,joint_pair(c,points[0])))
+
+    def test_horizontal_orientation_roundtrip(self):
+        for kind in ('scara','cartesian','cylindrical'):
+            c=Config(kind=kind,orientation=35)
+            p=(400,100,180)
+            q=inverse(c,p)
+            self.assertIsNotNone(q)
+            self.assertLess(math.dist(forward(c,q),p),1e-8)
+            self.assertAlmostEqual(tool_angle(c,q),math.radians(35))
+
+    def test_table_position_steps(self):
+        c=Config(mode='position',duration=4,points=[[300,100],[400,150],[500,100]])
+        self.assertEqual(table_pair(c,0),[300,100])
+        self.assertEqual(table_pair(c,.01),[400,150])
+        self.assertEqual(table_pair(c,2),[400,150])
+        self.assertEqual(table_pair(c,2.01),[500,100])
+        r=simulate(c)
+        self.assertLess(r.final,.1)
+
+    def test_invalid_table_and_joint_limits(self):
+        for points in ([],[[1,2]],[[1,2],[float('nan'),2]],[[1,2],[3]],[[1,2],['3',4]]):
+            with self.assertRaises(ValueError):Config(points=points).validate()
+        with self.assertRaisesRegex(ValueError,'ограничения'):
+            simulate(Config(coordinate_mode='joint',points=[[10,80],[200,90]]))
+        with self.assertRaisesRegex(ValueError,'вне рабочей области'):
+            simulate(Config(points=[[400,100],[9000,100]]))
+        with self.assertRaisesRegex(ValueError,'между строками'):
+            simulate(Config(duration=.02))
+
+    def test_table_result_snapshot_and_roundtrip(self):
+        c=Config(orientation=25,points=[[300,100],[400,120]])
+        r=simulate(c)
+        c.points[0][0]=9999
+        self.assertEqual(r.config.points[0][0],300)
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'project.json'
+            r.config.save(p)
+            self.assertEqual(Config.load(p),r.config)
+
+    def test_load_legacy_project(self):
+        import json
+        from dataclasses import asdict
+        data=asdict(Config(mode='position',path='line',end_z=260))
+        for k in ('orientation','coordinate_mode','points'):del data[k]
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'old.json'
+            p.write_text(json.dumps(data),encoding='utf-8')
+            c=Config.load(p)
+            self.assertEqual(c.end_z,260)
+            self.assertEqual(desired(c,2)[2],c.start_z)
+            self.assertEqual(c.orientation,0)
 
 
 if __name__=='__main__':unittest.main()

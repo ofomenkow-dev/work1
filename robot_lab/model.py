@@ -1,5 +1,6 @@
 """Independent teaching model. Units: millimetres, radians, seconds."""
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields
+from copy import deepcopy
 import csv
 import json
 import math
@@ -35,17 +36,21 @@ class Config:
     speed: float = 120.0
     angular_speed: float = 180.0
     duration: float = 4.0
-    mode: str = 'position'
-    path: str = 'line'
+    mode: str = 'contour'
+    path: str = 'table'
     start_x: float = 500.0
     start_y: float = 0.0
     start_z: float = 180.0
     end_x: float = 350.0
     end_y: float = 200.0
-    end_z: float = 260.0
+    end_z: float = 180.0  # Retained for old project files; plane height is start_z.
     center_x: float = 380.0
     center_y: float = 0.0
     radius: float = 80.0
+    orientation: float = 0.0
+    coordinate_mode: str = 'cartesian'
+    points: list = field(default_factory=lambda: [[280.,100.],[320.,180.],
+        [360.,100.],[400.,180.],[440.,100.],[480.,180.],[520.,100.]])
 
     def validate(self):
         for f in fields(self):
@@ -59,8 +64,23 @@ class Config:
             raise ValueError('Поддерживается формат проекта версии 1.')
         if self.kind not in ('scara', 'cartesian', 'cylindrical'):
             raise ValueError('Неизвестная кинематическая схема.')
-        if self.mode not in ('position', 'contour') or self.path not in ('line', 'circle'):
+        if self.mode not in ('position', 'contour') or self.path not in ('line', 'circle', 'table'):
             raise ValueError('Неизвестный режим или траектория.')
+        if self.mode=='position' and self.path=='circle':
+            raise ValueError('Окружность задаётся в контурном режиме; для позиционного используйте таблицу или отрезок.')
+        if self.coordinate_mode not in ('cartesian', 'joint'):
+            raise ValueError('Неизвестный формат пар координат.')
+        if not -180 <= self.orientation <= 180:
+            raise ValueError('Ориентация схвата: от −180° до 180°.')
+        if not 0 <= self.start_z <= self.zmax:
+            raise ValueError('Высота горизонтальной плоскости должна быть в пределах хода Z.')
+        if not isinstance(self.points, list) or not 2 <= len(self.points) <= 200:
+            raise ValueError('Таблица должна содержать от 2 до 200 пар.')
+        for row in self.points:
+            if not isinstance(row, (list, tuple)) or len(row) != 2 or any(
+                isinstance(v,bool) or not isinstance(v,(float,int)) or
+                not math.isfinite(v) or abs(v)>20000 for v in row):
+                raise ValueError('В каждой строке таблицы должны быть два конечных числа (модуль ≤ 20000).')
         for k in ('l1','l2','rmax','xmax','ymax','zmax','kp','tau','dt','frequency',
                   'speed','angular_speed','duration','radius'):
             if getattr(self, k) <= 0:
@@ -94,7 +114,9 @@ class Config:
         if p.stat().st_size > 100000:
             raise ValueError('Файл проекта слишком большой.')
         data = json.loads(p.read_text(encoding='utf-8'))
-        if not isinstance(data, dict) or set(data) != {f.name for f in fields(cls)}:
+        names = {f.name for f in fields(cls)}
+        added = {'orientation', 'coordinate_mode', 'points'}
+        if not isinstance(data, dict) or not names-added <= set(data) <= names:
             raise ValueError('Неверная структура проекта ROBOT Lab JSON.')
         return cls(**data).validate()
 
@@ -119,27 +141,29 @@ def forward(c, q):
 
 
 def inverse(c, p):
-    """Analytical inverse kinematics with phi=0; tries both elbow branches."""
+    """Analytical inverse kinematics with horizontal tool yaw."""
     x,y,z = p
+    phi = math.radians(c.orientation)
     rs = ranges(c)
     def valid(q):
         return all(lo-1e-7 <= v <= hi+1e-7 for v,(lo,hi) in zip(q,rs))
     if c.kind == 'cartesian':
-        q=(x,y,0,z)
+        q=(x,y,phi,z)
         return q if valid(q) else None
     if c.kind == 'cylindrical':
         a=math.atan2(y,x)
-        q=(a,math.hypot(x,y),-a,z)
+        q=(a,math.hypot(x,y),phi-a,z)
         return q if valid(q) else None
-    wx=x-c.l3
-    co=(wx*wx+y*y-c.l1*c.l1-c.l2*c.l2)/(2*c.l1*c.l2)
+    wx=x-c.l3*math.cos(phi)
+    wy=y-c.l3*math.sin(phi)
+    co=(wx*wx+wy*wy-c.l1*c.l1-c.l2*c.l2)/(2*c.l1*c.l2)
     if abs(co)>1+1e-9:
         return None
     for sign in (1,-1):
         b=sign*math.acos(clamp(co,-1,1))
-        a=math.atan2(y,wx)-math.atan2(c.l2*math.sin(b),c.l1+c.l2*math.cos(b))
+        a=math.atan2(wy,wx)-math.atan2(c.l2*math.sin(b),c.l1+c.l2*math.cos(b))
         a=math.atan2(math.sin(a),math.cos(a))
-        q=(a,b,-a-b,z)
+        q=(a,b,phi-a-b,z)
         if valid(q):
             return q
     return None
@@ -161,9 +185,50 @@ def workspace(c, n=24):
     return pts
 
 
+def tool_angle(c,q):
+    if c.kind == 'scara':
+        return q[0]+q[1]+q[2]
+    return q[0]+q[2] if c.kind == 'cylindrical' else q[2]
+
+
+def joint_pair(c,pair):
+    """Input pair units: SCARA deg/deg; cylinder deg/mm; Cartesian mm/mm."""
+    a,b=pair
+    phi=math.radians(c.orientation)
+    if c.kind=='scara':
+        a,b=math.radians(a),math.radians(b)
+        q=(a,b,phi-a-b,c.start_z)
+    elif c.kind=='cylindrical':
+        a=math.radians(a)
+        q=(a,b,phi-a,c.start_z)
+    else:
+        q=(a,b,phi,c.start_z)
+    if not all(lo-1e-7<=v<=hi+1e-7 for v,(lo,hi) in zip(q,ranges(c))):
+        raise ValueError('Пара суставных координат выходит за ограничения робота.')
+    return q
+
+
+def table_pair(c,t):
+    phase=clamp(t/c.duration,0,1)*(len(c.points)-1)
+    if c.mode=='position':
+        # Step to next point immediately after each equal-duration boundary.
+        index=min(len(c.points)-1,math.ceil(phase-1e-10))
+        return c.points[index]
+    i=min(len(c.points)-2,math.floor(phase))
+    u=phase-i
+    return [a+(b-a)*u for a,b in zip(c.points[i],c.points[i+1])]
+
+
 def desired(c,t):
     s=(c.start_x,c.start_y,c.start_z)
-    e=(c.end_x,c.end_y,c.end_z)
+    e=(c.end_x,c.end_y,c.start_z)
+    if c.path=='table':
+        if c.duration/(len(c.points)-1) < max(c.dt,1/c.frequency)-1e-10:
+            raise ValueError('Слишком мало времени между строками: увеличьте длительность или частоту расчёта/управления.')
+        pair=table_pair(c,t)
+        if c.coordinate_mode=='joint':
+            return forward(c,joint_pair(c,pair))
+        return (*pair,c.start_z)
     if c.mode=='position':
         return s if t==0 else e
     f=clamp(t/c.duration,0,1)
@@ -205,14 +270,23 @@ def simulate(c):
     if c.dt*c.frequency > 1+1e-9:
         raise ValueError('Шаг моделирования должен быть ≤ периода контроллера (1 / частота).')
     n=math.ceil(c.duration/c.dt)
+    if c.path=='table':
+        for i,pair in enumerate(c.points):
+            if c.coordinate_mode=='joint':
+                joint_pair(c,pair)
+            elif inverse(c,(*pair,c.start_z)) is None:
+                raise ValueError(f'Строка {i+1} таблицы вне рабочей области.')
     refs=[]
     for i in range(n+1):
         t=min(i*c.dt,c.duration)
         p=desired(c,t)
-        q=inverse(c,p)
+        q=(joint_pair(c,table_pair(c,t)) if c.path=='table' and
+           c.coordinate_mode=='joint' else inverse(c,p))
         if q is None:
             raise ValueError(f'Траектория вне рабочей области при t = {t:.3f} с. Измените координаты или ограничения.')
-        if refs and c.kind!='cartesian' and any(abs(q[j]-refs[-1][2][j])>math.pi for j in (0,2)):
+        if refs and c.kind!='cartesian' and c.mode=='contour' and not (
+            c.path=='table' and c.coordinate_mode=='joint') and any(
+                abs(q[j]-refs[-1][2][j])>math.pi for j in (0,2)):
             raise ValueError('Траектория пересекает разрыв угловой координаты. Измените траекторию.')
         refs.append((t,p,q))
     actual=list(refs[0][2])
@@ -230,11 +304,12 @@ def simulate(c):
         h=t-refs[i-1][0] if i else 0
         feedback=quant(actual)
         alpha=-math.expm1(-c.kp*h/c.tau)
-        for j in range(4):
+        for j in range(3):
             angular=j<3 if c.kind=='scara' else j in ((0,2) if c.kind=='cylindrical' else (2,))
             vmax=math.radians(c.angular_speed) if angular else c.speed
             change=clamp((command[j]-feedback[j])*alpha,-vmax*h,vmax*h)
             actual[j]=clamp(actual[j]+change,*rs[j])
+        actual[3]=c.start_z  # Drawing plane is mechanically fixed, not a Z servo.
         if t+1e-10>=next_tick:
             delayed=max(0,t-c.cycles/c.frequency)
             idx=min(n,math.floor(delayed/c.dt+1e-9))
@@ -244,4 +319,4 @@ def simulate(c):
         samples.append(Sample(t,p,measured,tuple(actual),math.dist(measured,p)))
     return Result(samples,max(s.error for s in samples),
                   math.sqrt(sum(s.error*s.error for s in samples)/len(samples)),
-                  samples[-1].error,replace(c))
+                  samples[-1].error,deepcopy(c))

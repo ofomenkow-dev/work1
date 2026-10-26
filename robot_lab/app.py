@@ -1,15 +1,18 @@
 """Russian-language Qt desktop application for the independent teaching model."""
 import os
 import sys
+import math
 from pathlib import Path
 os.environ.setdefault('MPLCONFIGDIR',str(Path.home()/'.robot-lab'/'matplotlib'))
 from PySide6.QtCore import Qt, QLocale, QTimer
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QHBoxLayout,QVBoxLayout,
     QLabel,QPushButton,QComboBox,QDoubleSpinBox,QSpinBox,QFormLayout,QGroupBox,
-    QTabWidget,QScrollArea,QFileDialog,QMessageBox,QSplitter,QFrame,QProgressBar)
+    QTabWidget,QScrollArea,QFileDialog,QMessageBox,QSplitter,QFrame,QProgressBar,
+    QTableWidget,QTableWidgetItem,QHeaderView,QAbstractItemView)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from .model import Config, forward, inverse, workspace, simulate
+from matplotlib.patches import FancyArrowPatch
+from .model import Config, forward, inverse, workspace, simulate, tool_angle, desired, joint_pair
 
 NAMES={'scara':'СКАРА','cartesian':'Декартовая','cylindrical':'Цилиндрическая'}
 STYLE='''
@@ -100,12 +103,13 @@ class Window(QMainWindow):
         title=QLabel('Моделирование манипуляторов')
         title.setObjectName('title')
         cl.addWidget(title)
-        subtitle=QLabel('Настройте робот, исследуйте рабочую область и сравните заданное движение с фактическим.')
+        subtitle=QLabel('Задайте пары координат или углов. Манипулятор вычертит след в горизонтальной плоскости XY.')
         subtitle.setWordWrap(True)
         subtitle.setObjectName('subtitle')
         cl.addWidget(subtitle)
         splitter=QSplitter(Qt.Horizontal)
         scroll=QScrollArea()
+        self.form_scroll=scroll
         scroll.setWidgetResizable(True)
         scroll.setMinimumWidth(310)
         form=QWidget()
@@ -118,10 +122,12 @@ class Window(QMainWindow):
         rl=QVBoxLayout(right)
         rl.setContentsMargins(6,0,0,0)
         self.tabs=QTabWidget()
-        self.workspace_plot=Plot('3d')
-        self.path_plot=Plot('3d')
+        self.workspace_plot=Plot()
+        self.path_plot=Plot()
         self.error_plot=Plot()
-        for plot,name in [(self.workspace_plot,'Рабочая область'),(self.path_plot,'Движение'),(self.error_plot,'Погрешность')]:
+        self.signals_plot=Plot()
+        for plot,name in [(self.workspace_plot,'Область XY'),(self.path_plot,'След XY'),
+                          (self.error_plot,'Погрешность'),(self.signals_plot,'Осциллограммы')]:
             self.tabs.addTab(plot,name)
         rl.addWidget(self.tabs,1)
         metrics=QHBoxLayout()
@@ -196,7 +202,7 @@ class Window(QMainWindow):
         f=self.group('01   Кинематическая схема')
         self.combo(f,'kind','Тип робота',[(v,k) for k,v in NAMES.items()])
         self.controls['kind'].currentIndexChanged.connect(self.update_fields)
-        self.geometry=self.group('02   Геометрия и ограничения')
+        self.geometry=self.group('04   Геометрия и ограничения')
         specs=[('l1','Звено L₁, мм',1,10000),('l2','Звено L₂, мм',1,10000),('l3','Инструмент L₃, мм',0,10000),
                ('q1min','q₁ минимум, °',-180,179),('q1max','q₁ максимум, °',-179,180),
                ('q2min','q₂ минимум, °',-180,179),('q2max','q₂ максимум, °',-179,180),
@@ -204,25 +210,47 @@ class Window(QMainWindow):
                ('xmax','Ход X, мм',1,10000),('ymax','Ход Y, мм',1,10000),('zmax','Ход Z, мм',1,10000)]
         for key,title,lo,hi in specs:
             self.number(self.geometry,key,title,lo,hi)
-        f=self.group('03   Управление и вычисления')
+        f=self.group('05   Управление и вычисления')
         for key,title,lo,hi,d in [('kp','Усиление Kp',.01,1000,2),('tau','Постоянная τ, с',.001,100,3),
             ('dt','Шаг расчёта, с',.001,.1,3),('frequency','Контроллер, Гц',1,10000,1),
             ('speed','Линейная скорость max, мм/с',.1,10000,1),('angular_speed','Угловая скорость max, °/с',.1,10000,1)]:
             self.number(f,key,title,lo,hi,d)
         self.number(f,'bits','Разрядность АЦП/ЦАП, бит',4,24,integer=True)
         self.number(f,'cycles','Задержка, тактов',0,100,integer=True)
-        self.motion=self.group('04   Исследование движения')
+        self.motion=self.group('02   Задание в плоскости XY')
         self.combo(self.motion,'mode','Режим',[('Позиционный','position'),('Контурный','contour')])
-        self.combo(self.motion,'path','Контур',[('Отрезок','line'),('Окружность','circle')])
-        for key,title in [('start_x','Начало X, мм'),('start_y','Начало Y, мм'),('start_z','Начало Z / высота круга, мм'),
-                          ('end_x','Конец X, мм'),('end_y','Конец Y, мм'),('end_z','Конец Z, мм'),
+        self.combo(self.motion,'path','Задание',[('Таблица пар','table'),('Отрезок','line'),('Окружность','circle')])
+        self.combo(self.motion,'coordinate_mode','Формат таблицы',
+                   [('Координаты X / Y, мм','cartesian'),('Суставные координаты q₁ / q₂','joint')])
+        for key,title in [('start_x','Начало X, мм'),('start_y','Начало Y, мм'),('start_z','Высота плоскости Z, мм'),
+                          ('end_x','Конец X, мм'),('end_y','Конец Y, мм'),
                           ('center_x','Центр круга X, мм'),('center_y','Центр круга Y, мм')]:
             self.number(self.motion,key,title,-20000,20000)
+        self.number(self.motion,'orientation','Ориентация схвата φ в XY, °',-180,180)
         self.number(self.motion,'radius','Радиус круга, мм',.1,10000)
         self.number(self.motion,'duration','Длительность, с',.002,60,3)
         self.controls['mode'].currentIndexChanged.connect(self.update_fields)
         self.controls['path'].currentIndexChanged.connect(self.update_fields)
-        note=QLabel('СКАРА: q₃ = ±360°. В траекториях ориентация инструмента φ = 0°. Область показана для всех ориентаций.\n\nСкорость задания контура определяется его длиной и длительностью.')
+        self.controls['coordinate_mode'].currentIndexChanged.connect(self.update_fields)
+        self.table_group=QGroupBox('03   Последовательность пар')
+        tl=QVBoxLayout(self.table_group)
+        self.point_table=QTableWidget(0,2)
+        self.point_table.setMinimumHeight(220)
+        self.point_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.point_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.point_table.cellChanged.connect(self.invalidate)
+        tl.addWidget(self.point_table)
+        row=QHBoxLayout()
+        for text,callback in [('＋ Строка',self.add_point),('− Строка',self.remove_point),('Пример',self.example_points)]:
+            b=QPushButton(text)
+            b.setStyleSheet('padding: 6px 8px; font-size: 12px;')
+            b.clicked.connect(callback)
+            row.addWidget(b)
+        tl.addLayout(row)
+        self.form_layout.addWidget(self.table_group)
+        self.form_layout.insertWidget(1,self.motion.parentWidget())
+        self.form_layout.insertWidget(2,self.table_group)
+        note=QLabel('Вид сверху: X вправо, Y вверх; Z фиксирована. Стрелка у схвата показывает его поворот в XY.\n\nСтроки таблицы следуют по порядку. Время между строками одинаковое. В контурном режиме пары интерполируются, в позиционном задание переключается ступенчато.\n\nПри смене формата таблицы проверьте единицы или нажмите «Пример».')
         note.setWordWrap(True)
         note.setStyleSheet('color: #62768b; padding: 10px;')
         self.form_layout.addWidget(note)
@@ -234,7 +262,7 @@ class Window(QMainWindow):
         form.labelForField(w).setVisible(on)
 
     def update_fields(self):
-        if not all(k in self.controls for k in ('kind','mode','path','duration')):
+        if not hasattr(self,'point_table'):
             return
         kind=self.controls['kind'].currentData()
         for k in ('l1','l2','l3','q2min','q2max'):
@@ -245,13 +273,24 @@ class Window(QMainWindow):
             self.set_visible(self.geometry,k,kind=='cylindrical')
         for k in ('xmax','ymax'):
             self.set_visible(self.geometry,k,kind=='cartesian')
+        path=self.controls['path'].currentData()
         contour=self.controls['mode'].currentData()=='contour'
-        circle=contour and self.controls['path'].currentData()=='circle'
-        self.set_visible(self.motion,'path',contour)
+        self.controls['path'].model().item(2).setEnabled(contour)
+        if path=='circle' and not contour:
+            self.controls['path'].setCurrentIndex(1)
+            path='line'
+        circle=path=='circle'
+        table=path=='table'
+        self.table_group.setVisible(table)
+        self.set_visible(self.motion,'coordinate_mode',table)
         for k in ('center_x','center_y','radius'):
             self.set_visible(self.motion,k,circle)
-        for k in ('end_x','end_y','end_z','start_x','start_y'):
-            self.set_visible(self.motion,k,not circle)
+        for k in ('end_x','end_y','start_x','start_y'):
+            self.set_visible(self.motion,k,not circle and not table)
+        joint=self.controls['coordinate_mode'].currentData()=='joint'
+        headers=(['q₁, °','q₂, °'] if kind=='scara' else
+                 ['q₁, °','Радиус, мм'] if kind=='cylindrical' else ['q₁, мм','q₂, мм'])
+        self.point_table.setHorizontalHeaderLabels(headers if joint else ['X, мм','Y, мм'])
 
     def populate(self,c):
         for key,w in self.controls.items():
@@ -261,10 +300,60 @@ class Window(QMainWindow):
             else:
                 w.setValue(getattr(c,key))
             w.blockSignals(False)
+        self.set_points(c.points)
         self.update_fields()
+
+    def set_points(self,points):
+        self.point_table.blockSignals(True)
+        self.point_table.setRowCount(len(points))
+        for row,pair in enumerate(points):
+            for col,v in enumerate(pair):
+                self.point_table.setItem(row,col,QTableWidgetItem(f'{v:g}'))
+        self.point_table.blockSignals(False)
+
+    def add_point(self):
+        if self.point_table.rowCount()>=200:
+            self.failure(ValueError('Не более 200 строк.'))
+            return
+        row=self.point_table.rowCount()
+        pair=[self.point_table.item(row-1,col).text() if row and self.point_table.item(row-1,col) else '0' for col in range(2)]
+        self.point_table.insertRow(row)
+        for col,v in enumerate(pair):
+            self.point_table.setItem(row,col,QTableWidgetItem(v))
+        self.invalidate()
+
+    def remove_point(self):
+        if self.point_table.rowCount()<=2:
+            self.failure(ValueError('Оставьте минимум две строки.'))
+            return
+        rows={i.row() for i in self.point_table.selectedIndexes()}
+        if not rows:
+            rows={self.point_table.rowCount()-1}
+        for row in sorted(rows,reverse=True):
+            if self.point_table.rowCount()>2:
+                self.point_table.removeRow(row)
+        self.invalidate()
+
+    def example_points(self):
+        if self.controls['coordinate_mode'].currentData()=='cartesian':
+            points=Config().points
+        else:
+            kind=self.controls['kind'].currentData()
+            points=([[-30,80],[-10,110],[10,80],[30,110],[50,80]] if kind=='scara' else
+                    [[-40,300],[-20,450],[0,300],[20,450],[40,300]] if kind=='cylindrical' else Config().points)
+        self.set_points(points)
+        self.invalidate()
 
     def read_config(self):
         values={k:(w.currentData() if isinstance(w,QComboBox) else w.value()) for k,w in self.controls.items()}
+        points=[]
+        for row in range(self.point_table.rowCount()):
+            try:
+                pair=[float(self.point_table.item(row,col).text().strip().replace(',','.')) for col in range(2)]
+            except (AttributeError,ValueError):
+                raise ValueError(f'Строка {row+1}: введите два числа.') from None
+            points.append(pair)
+        values['points']=points
         return Config(**values).validate()
 
     def stop_animation(self):
@@ -280,7 +369,7 @@ class Window(QMainWindow):
             metric.setText('—')
         self.progress.setValue(0)
         self.status.setText('Параметры изменены. Графики предыдущего расчёта устарели — пересчитайте.')
-        for plot in (self.workspace_plot,self.path_plot,self.error_plot):
+        for plot in (self.workspace_plot,self.path_plot,self.error_plot,self.signals_plot):
             if plot.ax.has_data():
                 plot.ax.set_title('Предыдущие параметры — требуется пересчёт',fontsize=10,color='#b06a20')
                 plot.refresh()
@@ -289,27 +378,35 @@ class Window(QMainWindow):
         self.status.setText(str(exc))
         QMessageBox.warning(self,'Проверьте параметры',str(exc))
 
-    def axes3(self,plot,title):
+    def axes_xy(self,plot,title):
         ax=plot.ax
         ax.clear()
         ax.set_title(title,loc='left',fontsize=12,pad=15)
         ax.set_xlabel('X, мм')
         ax.set_ylabel('Y, мм')
-        ax.set_zlabel('Z, мм')
-        ax.view_init(elev=26,azim=-55)
+        ax.set_aspect('equal',adjustable='box')
+        ax.grid(alpha=.18)
         return ax
 
     def equal_axes(self,ax,points):
         import numpy as np
-        p=np.array(points)
+        p=np.array(points)[:,:2]
         lo=p.min(axis=0)
         hi=p.max(axis=0)
         center=(lo+hi)/2
         span=max(max(hi-lo),1)*.55
         ax.set_xlim(center[0]-span,center[0]+span)
         ax.set_ylim(center[1]-span,center[1]+span)
-        ax.set_zlim(center[2]-span,center[2]+span)
-        ax.set_box_aspect((1,1,1),zoom=.86)
+        ax.set_aspect('equal',adjustable='box')
+
+    def xy(self,points):
+        return ([p[0] for p in points],[p[1] for p in points])
+
+    def heading_points(self,c,sample):
+        x,y,_=sample.actual
+        phi=tool_angle(c,sample.q)
+        length=max(c.l1+c.l2+c.l3 if c.kind=='scara' else c.rmax if c.kind=='cylindrical' else max(c.xmax,c.ymax),1)*.08
+        return (x,y),(x+length*math.cos(phi),y+length*math.sin(phi))
 
     def robot_line(self,c,q):
         from math import sin,cos
@@ -324,16 +421,16 @@ class Window(QMainWindow):
     def build_workspace(self):
         try:
             c=self.read_config()
-            pts=workspace(c)
-            ax=self.axes3(self.workspace_plot,f'{NAMES[c.kind]} · выборка достижимых положений')
-            ax.scatter(*zip(*pts),s=1,alpha=.16,color='#13a99b',rasterized=True)
-            q=inverse(c,(c.start_x,c.start_y,c.start_z))
+            pts=workspace(c)[::2]
+            ax=self.axes_xy(self.workspace_plot,f'{NAMES[c.kind]} · рабочая область XY, вид сверху')
+            ax.scatter(*self.xy(pts),s=2,alpha=.16,color='#13a99b',rasterized=True)
+            q=(joint_pair(c,c.points[0]) if c.path=='table' and c.coordinate_mode=='joint' else inverse(c,desired(c,0)))
             if q:
-                ax.plot(*zip(*self.robot_line(c,q)),color='#183b59',linewidth=5,marker='o',markersize=6)
+                ax.plot(*self.xy(self.robot_line(c,q)),color='#183b59',linewidth=5,marker='o',markersize=6)
             self.equal_axes(ax,pts)
             self.workspace_plot.refresh()
             self.tabs.setCurrentIndex(0)
-            self.status.setText(f'Область построена: {len(pts):,} точек на нижнем и верхнем срезах. По Z область непрерывна. Граница приближённая.')
+            self.status.setText(f'Вид сверху XY, Z = {c.start_z:g} мм. Область для всех ориентаций схвата; граница приближённая.')
         except ValueError as e:
             self.failure(e)
 
@@ -344,14 +441,22 @@ class Window(QMainWindow):
             result=simulate(c)
             self.result=result
             self.config=c
-            ax=self.axes3(self.path_plot,'Заданная и фактическая траектории')
+            ax=self.axes_xy(self.path_plot,f'Горизонтальная плоскость XY · Z = {c.start_z:g} мм')
             samples=result.samples
-            ax.plot(*zip(*(s.desired for s in samples)),color='#13a99b',linestyle='--',linewidth=2,label='Заданная')
-            ax.plot(*zip(*(s.actual for s in samples)),color='#274d76',linewidth=2,label='Фактическая')
+            ax.plot(*self.xy([s.desired for s in samples]),color='#13a99b',linestyle='--',linewidth=2,label='Заданный след')
+            self.trace_artist,=ax.plot(*self.xy([s.actual for s in samples]),color='#274d76',linewidth=2,label='След схвата')
             ax.legend(loc='upper left',fontsize=9)
-            line=self.robot_line(c,samples[0].q)
-            self.robot_artist,=ax.plot(*zip(*line),color='#e29940',marker='o',linewidth=4)
-            self.equal_axes(ax,[s.desired for s in samples]+[s.actual for s in samples]+line)
+            line=self.robot_line(c,samples[-1].q)
+            self.robot_artist,=ax.plot(*self.xy(line),color='#e29940',marker='o',linewidth=4)
+            self.heading_artist=FancyArrowPatch(*self.heading_points(c,samples[-1]),arrowstyle='-|>',mutation_scale=16,color='#b44d66',linewidth=2)
+            ax.add_patch(self.heading_artist)
+            bounds=[s.desired for s in samples]+[s.actual for s in samples]
+            # Include joint locations throughout the animation, not only at the last pose.
+            for s in samples[::max(1,len(samples)//200)]:
+                bounds.extend(self.robot_line(c,s.q))
+                bounds.extend((*p,c.start_z) for p in self.heading_points(c,s))
+            bounds.extend((*p,c.start_z) for p in self.heading_points(c,samples[-1]))
+            self.equal_axes(ax,bounds)
             self.path_plot.refresh()
             ax=self.error_plot.ax
             ax.clear()
@@ -364,6 +469,17 @@ class Window(QMainWindow):
             ax.set_title('Евклидова ошибка положения во времени',loc='left',fontsize=12)
             ax.grid(alpha=.18)
             self.error_plot.refresh()
+            ax=self.signals_plot.ax
+            ax.clear()
+            for j,name,color in [(0,'X','#274d76'),(1,'Y','#13a99b')]:
+                ax.plot(times,[s.actual[j] for s in samples],color=color,label=f'{name}(t) фактическая')
+                ax.plot(times,[s.desired[j] for s in samples],color=color,linestyle='--',alpha=.5,label=f'{name}(t) заданная')
+            ax.set_xlabel('Время, с')
+            ax.set_ylabel('Координата, мм')
+            ax.set_title('Осциллограммы горизонтальных координат',loc='left',fontsize=12)
+            ax.grid(alpha=.18)
+            ax.legend(fontsize=9)
+            self.signals_plot.refresh()
             for w,v in zip(self.metrics,(result.maximum,result.rms,result.final)):
                 w.setText(f'{v:.4f}')
             self.play.setEnabled(True)
@@ -384,19 +500,27 @@ class Window(QMainWindow):
             return
         if self.animation_index>=len(self.result.samples):
             self.animation_index=0
+        if self.animation_index==0:
+            self.draw_frame(0)
         self.tabs.setCurrentIndex(1)
         self.play.setText('Ⅱ Пауза')
         self.timer.start()
+
+    def draw_frame(self,i):
+        sample=self.result.samples[i]
+        self.robot_artist.set_data(*self.xy(self.robot_line(self.result.config,sample.q)))
+        self.trace_artist.set_data(*self.xy([s.actual for s in self.result.samples[:i+1]]))
+        self.heading_artist.set_positions(*self.heading_points(self.result.config,sample))
+        self.path_plot.refresh()
+        self.progress.setValue(round(100*i/(len(self.result.samples)-1)))
+        phi=math.degrees(tool_angle(self.result.config,sample.q))
+        self.status.setText(f'Время {sample.t:.2f} с · X={sample.actual[0]:.2f}, Y={sample.actual[1]:.2f} мм · φ={phi:.2f}° · ошибка {sample.error:.4f} мм')
 
     def animate(self):
         if not self.result:
             return
         i=min(self.animation_index,len(self.result.samples)-1)
-        sample=self.result.samples[i]
-        self.robot_artist.set_data_3d(*zip(*self.robot_line(self.result.config,sample.q)))
-        self.path_plot.refresh()
-        self.progress.setValue(round(100*i/(len(self.result.samples)-1)))
-        self.status.setText(f'Время {sample.t:.2f} с · ошибка {sample.error:.4f} мм')
+        self.draw_frame(i)
         self.animation_index+=max(1,round(.04/self.result.config.dt))
         if i==len(self.result.samples)-1:
             self.stop_animation()
